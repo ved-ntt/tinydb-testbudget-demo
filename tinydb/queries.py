@@ -286,7 +286,7 @@ class Query(QueryInstance):
         :param rhs: The value to compare against
         """
         return self._generate_test(
-            lambda value: value < rhs,
+            lambda value: value <= rhs,
             ('<', self._path, rhs)
         )
 
