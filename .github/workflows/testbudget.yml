@@ -1,0 +1,100 @@
+name: TestBudget
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  # TestBudget, pinned to a commit of the CSC 510 Group 9 repository
+  TESTBUDGET: "testbudget @ git+https://github.com/ssbajjur-ncstate/SE-CSC-510-Group-9@1f1457804a7656966993062427b1de98693e61b3"
+  # Pull requests get 30% of the full suite's recorded test time
+  BUDGET_FRACTION: "0.3"
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install TestBudget and pytest
+        run: python -m pip install "$TESTBUDGET" pytest
+
+      - name: Restore TestBudget history
+        uses: actions/cache/restore@v4
+        with:
+          path: .testbudget-cache
+          key: testbudget-${{ github.run_id }}
+          restore-keys: testbudget-
+
+      - name: Use cached history, or the committed seed
+        run: |
+          if [ -f .testbudget-cache/tb.db ]; then
+            cp .testbudget-cache/tb.db .testbudget/tb.db
+            cp -r .testbudget-cache/history/. .testbudget/history/
+            echo "Using history cached by earlier runs on master"
+          else
+            echo "Using the committed seed history"
+          fi
+
+      - name: Build test-to-file links
+        run: testbudget links --build --root . --output .testbudget/links.json --history .testbudget/history
+
+      - name: Plan the tests (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          budget=$(python .testbudget/budget.py .testbudget/history "$BUDGET_FRACTION")
+          args=()
+          while IFS= read -r f; do
+            [ -n "$f" ] && args+=(--changed "$f")
+          done < <(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          echo "Changed files: ${args[*]}"
+          echo "Budget: ${budget}s"
+          testbudget plan "${args[@]}" --budget "$budget" \
+            --db .testbudget/tb.db --links .testbudget/links.json \
+            --history .testbudget/history \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --output plan.json > plan.txt
+          head -40 plan.txt
+          echo "..."
+          tail -4 plan.txt
+
+      - name: Post the plan as a check and job summary (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .testbudget/report.py plan.json "${{ github.repository }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run only the planned tests (pull request)
+        if: github.event_name == 'pull_request'
+        run: python -m pytest -q -o addopts= -p testbudget.adapters.pytest_adapter --testbudget-plan plan.json --junitxml=junit.xml
+
+      - name: Run the full suite (master)
+        if: github.event_name == 'push'
+        run: python -m pytest -q -o addopts= --junitxml=junit.xml
+
+      - name: Record the results in history (master)
+        if: always() && github.event_name == 'push' && hashFiles('junit.xml') != ''
+        run: |
+          changed=$(git diff --name-only HEAD~1 HEAD -- 'tinydb/*.py' | head -1)
+          testbudget ingest junit.xml --db .testbudget/tb.db ${changed:+--changed-file "$changed"}
+          testbudget migrate --db .testbudget/tb.db --history-dir .testbudget/history
+          mkdir -p .testbudget-cache
+          cp -r .testbudget/tb.db .testbudget/history .testbudget-cache/
+
+      - name: Save TestBudget history
+        if: always() && github.event_name == 'push' && hashFiles('.testbudget-cache/tb.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .testbudget-cache
+          key: testbudget-${{ github.run_id }}
